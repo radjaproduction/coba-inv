@@ -3009,6 +3009,7 @@ async function fetchBayarSebagianData() {
     // dari HP/device lain, tampilan di sini ikut ter-update otomatis tanpa perlu refresh manual.
     let _realtimeChannel = null;
     let _realtimeDebounceTimer = null;
+    let _realtimeReconnectTimer = null;
     const REALTIME_TABLES = ['vendor', 'brand', 'model', 'warna', 'ukuran', 'pengaturan', 'riwayat_input', 'riwayat_input_item', 'transaksi', 'transaksi_item', 'pelunasan', 'beban_operasional'];
 
     // Peta nama tabel Supabase -> "grup" data. Tabel yang datanya digabung jadi 1 entity
@@ -3048,12 +3049,63 @@ async function fetchBayarSebagianData() {
         ch.subscribe((status) => {
             if (status === 'SUBSCRIBED') {
                 console.log('✅ Realtime sync aktif');
-            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                clearTimeout(_realtimeReconnectTimer);
+                // Begitu (re)konek, tarik ulang semua data — jaga-jaga ada perubahan
+                // yang terjadi selagi koneksi realtime tadi terputus/belum nyambung.
+                forceRefreshAllGroups();
+            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
                 console.warn('⚠️ Realtime sync gagal terhubung:', status);
+                // PERBAIKAN: sebelumnya kalau koneksi realtime putus (tab lama tidak aktif,
+                // device hemat baterai, WiFi sempat drop, dsb), channel mati begitu saja
+                // tanpa reconnect — akibatnya data baru dari device lain (mis. transaksi dari
+                // app Pesanan) tidak pernah muncul otomatis sampai user refresh manual.
+                // Sekarang: coba sambung ulang otomatis setelah jeda singkat.
+                try { sbClient.removeChannel(ch); } catch (e) {}
+                _realtimeChannel = null;
+                clearTimeout(_realtimeReconnectTimer);
+                _realtimeReconnectTimer = setTimeout(initRealtimeSync, 3000);
             }
         });
         _realtimeChannel = ch;
     }
+
+    // Dipakai saat channel realtime baru (re)konek, atau saat tab kembali aktif setelah
+    // sempat di-background — menandai SEMUA grup data sebagai "kotor" supaya semuanya
+    // ditarik ulang & di-render ulang sekali, tanpa perlu refresh manual.
+    function forceRefreshAllGroups() {
+        Object.keys(REALTIME_GROUP_HANDLERS).forEach(g => _dirtyGroups.add(g));
+        clearTimeout(_realtimeDebounceTimer);
+        _realtimeDebounceTimer = setTimeout(async () => {
+            const groups = [..._dirtyGroups];
+            _dirtyGroups.clear();
+            try {
+                await Promise.all(groups.map(g => REALTIME_GROUP_HANDLERS[g]?.fetch?.()));
+                groups.forEach(g => REALTIME_GROUP_HANDLERS[g]?.render?.());
+            } catch (e) {
+                console.warn('Force refresh gagal:', e.message);
+            }
+        }, 150);
+    }
+
+    // PERBAIKAN: browser/PWA sering menahan (throttle) atau memutus WebSocket saat tab
+    // pindah ke background (layar dikunci, pindah app, dsb). Saat tab aktif kembali,
+    // pastikan channel realtime masih tersambung (reconnect kalau perlu) DAN tarik ulang
+    // semua data sebagai jaring pengaman untuk perubahan yang mungkin terlewat.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible' || !sbClient) return;
+        const st = _realtimeChannel && _realtimeChannel.state;
+        if (st !== 'joined' && st !== 'joining') {
+            _realtimeChannel = null;
+            initRealtimeSync();
+        } else {
+            forceRefreshAllGroups();
+        }
+    });
+    window.addEventListener('online', () => {
+        if (!sbClient) return;
+        _realtimeChannel = null;
+        initRealtimeSync();
+    });
 
     // Debounce + kumpulkan grup yang "kotor" (berubah): kalau ada banyak perubahan sekaligus
     // (misal 1 transaksi + beberapa item), cukup fetch & render grup terkait sekali saja,
