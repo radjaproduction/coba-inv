@@ -3149,7 +3149,7 @@ async function fetchBayarSebagianData() {
                 return;
             }
             _speakInProgress = true;
-            const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka');
+            const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka donk');
             utter.lang = 'id-ID';
             utter.rate = 0.95;
             utter.pitch = 1;
@@ -3240,7 +3240,7 @@ async function fetchBayarSebagianData() {
                 pesananMenungguCount++;
                 _updatePesananBellBadge();
                 showToast('📦 Pesanan baru masuk: ' + (row.order_code || '-'));
-                _speakPesananAlarm('Ada pesanan masuk, harap segera dibuka');
+                _speakPesananAlarm('Ada pesanan masuk, harap segera dibuka donk');
                 _showPesananSystemNotif(row);
             }
         } else if (payload.eventType === 'UPDATE') {
