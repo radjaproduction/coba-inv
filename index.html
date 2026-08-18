@@ -3089,8 +3089,20 @@ async function fetchBayarSebagianData() {
     // saja, supaya alarm pesanan nanti (yang dipicu event Realtime, bukan klik langsung)
     // tetap bisa bunyi.
     function _unlockPesananAudio() {
-        if (_audioCtxPesanan) return;
-        try { _audioCtxPesanan = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+        if (!_audioCtxPesanan) {
+            try { _audioCtxPesanan = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+        }
+        // "Unlock" speech synthesis juga: sebagian browser (terutama Safari/iOS) memblokir
+        // speechSynthesis.speak() yang dipicu tanpa interaksi user langsung. Ucapkan teks
+        // kosong/nyaris tak terdengar sekali di sentuhan/klik pertama supaya alarm suara
+        // pesanan nanti (dipicu event Realtime, bukan klik langsung) tetap bisa bunyi.
+        try {
+            if ('speechSynthesis' in window) {
+                const unlockUtter = new SpeechSynthesisUtterance(' ');
+                unlockUtter.volume = 0;
+                speechSynthesis.speak(unlockUtter);
+            }
+        } catch (e) {}
     }
     window.addEventListener('touchstart', _unlockPesananAudio, { once: true, passive: true });
     window.addEventListener('click', _unlockPesananAudio, { once: true });
@@ -3112,6 +3124,38 @@ async function fetchBayarSebagianData() {
             };
             beep(0, 880); beep(0.32, 1046.5); // dua nada naik, ala notifikasi
         } catch (e) { console.warn('Alarm pesanan gagal diputar:', e.message); }
+    }
+
+    // Suara manusia (Text-to-Speech bawaan browser) yang mengucapkan "Ada pesanan masuk,
+    // harap segera dibuka" saat pesanan baru masuk — menggantikan/menambah bunyi beep di atas.
+    // Pakai Web Speech API (SpeechSynthesis), gratis & tidak perlu file audio.
+    // Kalau browser tidak mendukung TTS ini (jarang terjadi), otomatis fallback ke beep biasa.
+    let _voicesPesananReady = false;
+    if ('speechSynthesis' in window) {
+        // Voices sering baru ke-load ASYNC setelah event ini — tanpa nunggu, voice Indonesia
+        // kadang tidak kepilih di percobaan pertama.
+        speechSynthesis.addEventListener('voiceschanged', () => { _voicesPesananReady = true; });
+    }
+    function _speakPesananAlarm(text) {
+        try {
+            if (!('speechSynthesis' in window)) { _playPesananAlarm(); return; }
+            speechSynthesis.cancel(); // hentikan antrian ucapan lama (jaga-jaga ada pesanan beruntun)
+            const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka');
+            utter.lang = 'id-ID';
+            utter.rate = 0.95;
+            utter.pitch = 1;
+            utter.volume = 1;
+            // Pilih suara Bahasa Indonesia kalau tersedia di device; kalau tidak ada,
+            // biarkan browser pakai suara default (masih akan terbaca, cuma logat berbeda).
+            const voices = speechSynthesis.getVoices();
+            const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('id'));
+            if (idVoice) utter.voice = idVoice;
+            utter.onerror = () => _playPesananAlarm(); // fallback beep kalau TTS gagal di tengah jalan
+            speechSynthesis.speak(utter);
+        } catch (e) {
+            console.warn('Suara pesanan gagal diputar, fallback ke beep:', e.message);
+            _playPesananAlarm();
+        }
     }
 
     function _updatePesananBellBadge() {
@@ -3166,7 +3210,7 @@ async function fetchBayarSebagianData() {
                 pesananMenungguCount++;
                 _updatePesananBellBadge();
                 showToast('📦 Pesanan baru masuk: ' + (row.order_code || '-'));
-                _playPesananAlarm();
+                _speakPesananAlarm('Ada pesanan masuk, harap segera dibuka');
                 _showPesananSystemNotif(row);
             }
         } else if (payload.eventType === 'UPDATE') {
