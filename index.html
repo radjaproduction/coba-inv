@@ -3149,7 +3149,7 @@ async function fetchBayarSebagianData() {
                 return;
             }
             _speakInProgress = true;
-            const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka donk');
+            const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka');
             utter.lang = 'id-ID';
             utter.rate = 0.95;
             utter.pitch = 1;
@@ -3172,6 +3172,25 @@ async function fetchBayarSebagianData() {
         }
     }
 
+    // Alarm suara diulang tiap 20 detik SELAMA masih ada pesanan yang belum dikonfirmasi
+    // (stage:0). Berhenti otomatis begitu admin klik "✅ Konfirmasi Pesanan" di app Pesanan
+    // (stage berubah jadi 1 → event UPDATE realtime → pesananMenungguCount turun ke 0).
+    const PESANAN_REPEAT_INTERVAL_MS = 20000;
+    let _pesananRepeatTimer = null;
+    function _startPesananRepeatAlarm() {
+        if (_pesananRepeatTimer) return; // sudah jalan, tidak perlu start ulang
+        _pesananRepeatTimer = setInterval(() => {
+            if (pesananMenungguCount <= 0) { _stopPesananRepeatAlarm(); return; }
+            const teks = pesananMenungguCount > 1
+                ? 'Masih ada ' + pesananMenungguCount + ' pesanan yang belum dibuka, harap segera diproses'
+                : 'Masih ada pesanan yang belum dibuka, harap segera diproses';
+            _speakPesananAlarm(teks);
+        }, PESANAN_REPEAT_INTERVAL_MS);
+    }
+    function _stopPesananRepeatAlarm() {
+        if (_pesananRepeatTimer) { clearInterval(_pesananRepeatTimer); _pesananRepeatTimer = null; }
+    }
+
     function _updatePesananBellBadge() {
         const badge = document.getElementById('pesanan-bell-badge');
         if (badge) {
@@ -3184,6 +3203,9 @@ async function fetchBayarSebagianData() {
         }
         const btn = document.getElementById('pesanan-bell-btn');
         if (btn) btn.classList.toggle('pesanan-bell-ring', pesananMenungguCount > 0);
+        // Nyalakan/matikan repeat alarm mengikuti ada-tidaknya pesanan yang masih menunggu.
+        if (pesananMenungguCount > 0) _startPesananRepeatAlarm();
+        else _stopPesananRepeatAlarm();
     }
 
     function onPesananBellClick() {
@@ -3240,7 +3262,7 @@ async function fetchBayarSebagianData() {
                 pesananMenungguCount++;
                 _updatePesananBellBadge();
                 showToast('📦 Pesanan baru masuk: ' + (row.order_code || '-'));
-                _speakPesananAlarm('Ada pesanan masuk, harap segera dibuka donk');
+                _speakPesananAlarm('Ada pesanan masuk, harap segera dibuka');
                 _showPesananSystemNotif(row);
             }
         } else if (payload.eventType === 'UPDATE') {
