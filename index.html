@@ -3112,17 +3112,23 @@ async function fetchBayarSebagianData() {
             if (!_audioCtxPesanan) _audioCtxPesanan = new (window.AudioContext || window.webkitAudioContext)();
             const ctx = _audioCtxPesanan;
             if (ctx.state === 'suspended') ctx.resume();
-            const beep = (t, freq) => {
+            // Volume dinaikkan ke maksimal (1.0, dari sebelumnya 0.35) dan waveform diganti
+            // dari 'sine' (lembut) ke 'square' (nyaring/tajam, lebih gampang kedengaran di
+            // speaker kecil HP) — supaya lebih "nampol" dipakai jaga-jaga saat layar HP mati
+            // dan TTS tidak bisa jalan (lihat batasan browser di komentar _speakPesananAlarm).
+            const beep = (t, freq, durasi) => {
                 const osc = ctx.createOscillator();
                 const gain = ctx.createGain();
-                osc.type = 'sine'; osc.frequency.value = freq;
+                osc.type = 'square'; osc.frequency.value = freq;
                 gain.gain.setValueAtTime(0.0001, ctx.currentTime + t);
-                gain.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + t + 0.02);
-                gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.28);
+                gain.gain.exponentialRampToValueAtTime(1.0, ctx.currentTime + t + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + durasi);
                 osc.connect(gain); gain.connect(ctx.destination);
-                osc.start(ctx.currentTime + t); osc.stop(ctx.currentTime + t + 0.3);
+                osc.start(ctx.currentTime + t); osc.stop(ctx.currentTime + t + durasi + 0.02);
             };
-            beep(0, 880); beep(0.32, 1046.5); // dua nada naik, ala notifikasi
+            // 4 nada naik-turun cepat (bukan cuma 2), total durasi lebih panjang supaya lebih
+            // sulit kelewat/kelupaan dibanding versi lama yang cuma dua "tit" pelan.
+            beep(0, 880, 0.22); beep(0.22, 1318.5, 0.22); beep(0.44, 880, 0.22); beep(0.66, 1318.5, 0.3);
         } catch (e) { console.warn('Alarm pesanan gagal diputar:', e.message); }
     }
 
