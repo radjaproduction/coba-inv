@@ -3153,7 +3153,12 @@ async function fetchBayarSebagianData() {
                 console.log('[Suara Pesanan] Masih ada ucapan berjalan, panggilan baru diabaikan (mencegah tabrakan).');
                 return;
             }
+            // Sebagian Chrome Android kadang "nyangkut" di state paused tanpa sebab jelas
+            // (bug lama Chromium) — resume() dulu sebelum speak() supaya tidak diam-diam
+            // diabaikan oleh browser.
+            try { speechSynthesis.resume(); } catch (e) {}
             _speakInProgress = true;
+            let _settled = false; // jadi true begitu onstart/onend/onerror kepanggil
             const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka');
             utter.rate = 0.95;
             utter.pitch = 1;
@@ -3168,9 +3173,14 @@ async function fetchBayarSebagianData() {
             // _isRetry: lang/voice sengaja TIDAK diisi sama sekali, biar browser/HP pakai
             // suara default bawaannya sendiri (biasanya Bahasa Inggris, tapi tetap suara
             // manusia — lebih baik daripada beep).
-            utter.onstart = () => console.log('[Suara Pesanan] Mulai bicara...' + (_isRetry ? ' (pakai suara default, id-ID tidak tersedia)' : ''));
+            utter.onstart = () => {
+                _settled = true;
+                console.log('[Suara Pesanan] Mulai bicara...' + (_isRetry ? ' (pakai suara default, id-ID tidak tersedia)' : ''));
+                if (typeof showToast === 'function') showToast('🔊 Suara notifikasi jalan' + (_isRetry ? ' (suara default)' : ' (id-ID)'));
+            };
             utter.onend = () => { _speakInProgress = false; console.log('[Suara Pesanan] Selesai.'); };
             utter.onerror = (ev) => {
+                _settled = true;
                 _speakInProgress = false;
                 console.warn('[Suara Pesanan] TTS gagal (percobaan ' + (_isRetry ? 'ke-2, default voice' : 'ke-1, id-ID') + '). Alasan:', ev.error);
                 if (!_isRetry) {
@@ -3179,10 +3189,28 @@ async function fetchBayarSebagianData() {
                     _speakPesananAlarm(text, true);
                 } else {
                     console.warn('[Suara Pesanan] Suara default juga gagal, HP ini kemungkinan tidak punya TTS engine yang jalan. Fallback ke beep.');
+                    if (typeof showToast === 'function') showToast('🔇 TTS gagal (' + (ev.error || '?') + '), pakai beep');
                     _playPesananAlarm();
                 }
             };
             speechSynthesis.speak(utter);
+            // WATCHDOG: sebagian Chrome Android memblokir speak() yang dipicu TANPA sentuhan/klik
+            // langsung (misal dipicu event Realtime dari server) secara DIAM-DIAM — tidak ada
+            // onstart maupun onerror yang pernah kepanggil, cuma diabaikan begitu saja. Tanpa
+            // watchdog ini, _speakInProgress akan nyangkut true selamanya (semua notifikasi
+            // pesanan berikutnya ikut bisu) dan tidak pernah fallback ke beep/percobaan ke-2.
+            setTimeout(() => {
+                if (_settled) return; // sudah ditangani onstart/onerror, aman
+                _speakInProgress = false;
+                console.warn('[Suara Pesanan] TTS tidak merespons dalam 2 detik (kemungkinan diblokir browser tanpa error). Percobaan: ' + (_isRetry ? 'ke-2' : 'ke-1'));
+                try { speechSynthesis.cancel(); } catch (e) {}
+                if (!_isRetry) {
+                    _speakPesananAlarm(text, true);
+                } else {
+                    if (typeof showToast === 'function') showToast('🔇 TTS diblokir browser, pakai beep');
+                    _playPesananAlarm();
+                }
+            }, 2000);
         } catch (e) {
             _speakInProgress = false;
             console.warn('Suara pesanan gagal diputar, fallback ke beep:', e.message);
