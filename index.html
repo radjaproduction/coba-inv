@@ -2540,7 +2540,24 @@ END $$;</textarea>
             const loadingText = document.querySelector('#loading-overlay span');
             if (loadingText) loadingText.textContent = 'MENGHUBUNGKAN KE DATABASE...';
 
-            sbClient = window.supabase.createClient(url, key);
+            // PENTING: tanpa opsi realtime di bawah ini, koneksi WebSocket Realtime bisa "silent
+            // disconnect" tiap ~30-60 detik — browser men-throttle timer JS di tab (untuk hemat
+            // resource), sehingga heartbeat telat terkirim dan server menganggap koneksi mati.
+            // worker:true memindahkan heartbeat ke Web Worker (kebal throttling tab), dan
+            // heartbeatCallback jadi jaring pengaman: begitu status 'disconnected' terdeteksi,
+            // langsung reconnect eksplisit tanpa menunggu event CLOSED dari channel.
+            // Ref: https://supabase.com/docs/guides/troubleshooting/realtime-handling-silent-disconnections-in-backgrounded-applications-592794
+            sbClient = window.supabase.createClient(url, key, {
+                realtime: {
+                    worker: true,
+                    heartbeatCallback: (status) => {
+                        if (status === 'disconnected' || status === 'timeout') {
+                            console.warn('⚠️ Realtime heartbeat ' + status + ', reconnect paksa...');
+                            try { sbClient.realtime.connect(); } catch (e) {}
+                        }
+                    },
+                },
+            });
 
             // Tes koneksi dengan timeout 15 detik
             await withTimeout(
