@@ -334,6 +334,14 @@
             flex-shrink: 0;
         }
         @keyframes badgePop { from { transform: scale(0); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        /* Notifikasi Pesanan Masuk (dari app Pesanan, tabel produksi_orders) */
+        .pesanan-bell-ring i { animation: pesananBellRing 1.8s ease-in-out infinite; transform-origin: 50% 20%; }
+        @keyframes pesananBellRing {
+            0%, 100% { transform: rotate(0deg); }
+            10%, 30% { transform: rotate(-14deg); }
+            20%, 40% { transform: rotate(14deg); }
+            50% { transform: rotate(0deg); }
+        }
         .slide-in { animation: slideInRight 0.3s forwards; }
         .slide-out { animation: slideOutRight 0.3s forwards; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
@@ -1878,6 +1886,14 @@ END $$;</textarea>
                 <span class="text-[9px] text-red-500/70 transition-all font-normal">Exit</span>
             </div>
         </div>
+
+        <!-- BEL NOTIFIKASI PESANAN MASUK (dari app Pesanan — supaya tidak perlu buka app itu) -->
+        <div id="pesanan-bell-wrap" class="fixed z-40 hidden" style="top:calc(env(safe-area-inset-top,0px) + 12px); right:12px;">
+            <div id="pesanan-bell-btn" onclick="onPesananBellClick()" class="relative w-11 h-11 rounded-full bg-black/85 border-2 border-[#FFB144] flex items-center justify-center shadow-lg cursor-pointer active:scale-95 transition-transform">
+                <i class="fa-solid fa-bell text-[#FFB144] text-base"></i>
+                <div id="pesanan-bell-badge" class="vendor-notif-badge hidden" style="position:absolute; top:-4px; right:-4px;">0</div>
+            </div>
+        </div>
     </div><!-- end #main-app -->
 
     <script>
@@ -1962,6 +1978,7 @@ END $$;</textarea>
         initUI();
         muatStatusPIN();
         initRealtimeSync();
+        initPesananNotif();
     }
 
     // ==================== SLIDE TO UNLOCK (ala iPhone, menggantikan numpad PIN login) ====================
@@ -2865,7 +2882,7 @@ END $$;`;
             appData.riwayatTransaksi = (trx.data || []).map(t => ({
                 id: t.id, vendor: t.vendor, brand: t.brand, model: t.model,
                 harga: t.harga || 0, hargaModal: t.harga_modal || 0, status: t.status,
-                tanggal: t.tanggal, jam: t.jam,
+                tanggal: t.tanggal, jam: t.jam, orderCode: t.order_code || null,
                 items: trxItemsMap[t.id] || []
             }));
 
@@ -3009,7 +3026,6 @@ async function fetchBayarSebagianData() {
     // dari HP/device lain, tampilan di sini ikut ter-update otomatis tanpa perlu refresh manual.
     let _realtimeChannel = null;
     let _realtimeDebounceTimer = null;
-    let _realtimeReconnectTimer = null;
     const REALTIME_TABLES = ['vendor', 'brand', 'model', 'warna', 'ukuran', 'pengaturan', 'riwayat_input', 'riwayat_input_item', 'transaksi', 'transaksi_item', 'pelunasan', 'beban_operasional'];
 
     // Peta nama tabel Supabase -> "grup" data. Tabel yang datanya digabung jadi 1 entity
@@ -3040,40 +3056,159 @@ async function fetchBayarSebagianData() {
     bebanOperasional: { fetch: loadBebanInputList, render: () => {} },
     };
 
-    function initRealtimeSync() {
-        if (!sbClient || _realtimeChannel) return; // belum konek atau sudah aktif
-        let ch = sbClient.channel('radja-realtime-sync');
-        REALTIME_TABLES.forEach(t => {
-            ch = ch.on('postgres_changes', { event: '*', schema: 'public', table: t }, onRealtimeChange);
-        });
-        ch.subscribe((status) => {
-            if (status === 'SUBSCRIBED') {
-                console.log('✅ Realtime sync aktif');
-                clearTimeout(_realtimeReconnectTimer);
-                // Begitu (re)konek, tarik ulang semua data — jaga-jaga ada perubahan
-                // yang terjadi selagi koneksi realtime tadi terputus/belum nyambung.
-                forceRefreshAllGroups();
-            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-                console.warn('⚠️ Realtime sync gagal terhubung:', status);
-                // PERBAIKAN: sebelumnya kalau koneksi realtime putus (tab lama tidak aktif,
-                // device hemat baterai, WiFi sempat drop, dsb), channel mati begitu saja
-                // tanpa reconnect — akibatnya data baru dari device lain (mis. transaksi dari
-                // app Pesanan) tidak pernah muncul otomatis sampai user refresh manual.
-                // Sekarang: coba sambung ulang otomatis setelah jeda singkat.
-                try { sbClient.removeChannel(ch); } catch (e) {}
-                _realtimeChannel = null;
-                clearTimeout(_realtimeReconnectTimer);
-                _realtimeReconnectTimer = setTimeout(initRealtimeSync, 3000);
-            }
-        });
-        _realtimeChannel = ch;
+    // ==================== NOTIFIKASI PESANAN MASUK (dari app Pesanan) ====================
+    // App Pesanan (index.html) dipakai oleh vendor untuk order produksi, terpisah dari app
+    // Inventory ini, tapi keduanya nyambung ke project Supabase yang SAMA. Jadi tanpa perlu
+    // buka app Pesanan sama sekali, di sini kita dengarkan tabel produksi_orders lewat
+    // Realtime dan tampilkan badge + toast + alarm + notifikasi sistem begitu ada order baru.
+    // Badge selalu mencerminkan JUMLAH PESANAN YANG MASIH MENUNGGU (stage 0) secara live —
+    // otomatis berkurang begitu vendor/admin mengonfirmasi pesanan di app Pesanan.
+    const PESANAN_TABLE = 'produksi_orders';
+    let pesananMenungguCount = 0;
+    let _audioCtxPesanan = null;
+
+    // Browser umumnya blokir audio yang diputar otomatis sebelum ada interaksi user sama
+    // sekali di halaman. "Buka kunci" AudioContext begitu user pertama kali sentuh/klik apa
+    // saja, supaya alarm pesanan nanti (yang dipicu event Realtime, bukan klik langsung)
+    // tetap bisa bunyi.
+    function _unlockPesananAudio() {
+        if (_audioCtxPesanan) return;
+        try { _audioCtxPesanan = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+    }
+    window.addEventListener('touchstart', _unlockPesananAudio, { once: true, passive: true });
+    window.addEventListener('click', _unlockPesananAudio, { once: true });
+
+    function _playPesananAlarm() {
+        try {
+            if (!_audioCtxPesanan) _audioCtxPesanan = new (window.AudioContext || window.webkitAudioContext)();
+            const ctx = _audioCtxPesanan;
+            if (ctx.state === 'suspended') ctx.resume();
+            const beep = (t, freq) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine'; osc.frequency.value = freq;
+                gain.gain.setValueAtTime(0.0001, ctx.currentTime + t);
+                gain.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + t + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.28);
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.start(ctx.currentTime + t); osc.stop(ctx.currentTime + t + 0.3);
+            };
+            beep(0, 880); beep(0.32, 1046.5); // dua nada naik, ala notifikasi
+        } catch (e) { console.warn('Alarm pesanan gagal diputar:', e.message); }
     }
 
-    // Dipakai saat channel realtime baru (re)konek, atau saat tab kembali aktif setelah
-    // sempat di-background — menandai SEMUA grup data sebagai "kotor" supaya semuanya
-    // ditarik ulang & di-render ulang sekali, tanpa perlu refresh manual.
-    function forceRefreshAllGroups() {
-        Object.keys(REALTIME_GROUP_HANDLERS).forEach(g => _dirtyGroups.add(g));
+    function _updatePesananBellBadge() {
+        const badge = document.getElementById('pesanan-bell-badge');
+        if (badge) {
+            if (pesananMenungguCount > 0) {
+                badge.textContent = pesananMenungguCount > 99 ? '99+' : String(pesananMenungguCount);
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+        const btn = document.getElementById('pesanan-bell-btn');
+        if (btn) btn.classList.toggle('pesanan-bell-ring', pesananMenungguCount > 0);
+    }
+
+    function onPesananBellClick() {
+        if (pesananMenungguCount > 0) {
+            showToast('🔔 ' + pesananMenungguCount + ' pesanan menunggu konfirmasi — buka app Pesanan untuk proses.');
+        } else {
+            showToast('✅ Tidak ada pesanan baru yang menunggu.');
+        }
+    }
+
+    async function _requestPesananNotifPermission() {
+        if (!('Notification' in window)) return;
+        if (Notification.permission === 'default') {
+            try { await Notification.requestPermission(); } catch (e) {}
+        }
+    }
+
+    function _showPesananSystemNotif(order) {
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+        try {
+            const itemCount = Array.isArray(order.items) ? order.items.reduce((a, i) => a + (i.qty || 0), 0) : 0;
+            const n = new Notification('📦 Pesanan Baru Masuk', {
+                body: (order.order_code || '-') + (itemCount ? ' — ' + itemCount + ' pcs' : '') + (order.note ? '\n📝 ' + order.note : ''),
+                tag: 'pesanan-' + order.order_code,
+            });
+            n.onclick = () => { window.focus(); n.close(); };
+        } catch (e) {}
+    }
+
+    // Dipasang sebagai listener tambahan pada channel Realtime yang sama di initRealtimeSync().
+    // Dipisah dari REALTIME_GROUP_HANDLERS karena app ini tidak menyimpan data pesanan sendiri —
+    // hanya perlu tahu ADA perubahan untuk urusan notifikasi, bukan nge-fetch & render ulang data.
+    function onPesananRealtimeChange(payload) {
+        const row = payload.new || {}, oldRow = payload.old || {};
+        if (payload.eventType === 'INSERT') {
+            if ((row.stage || 0) === 0) {
+                pesananMenungguCount++;
+                _updatePesananBellBadge();
+                showToast('📦 Pesanan baru masuk: ' + (row.order_code || '-'));
+                _playPesananAlarm();
+                _showPesananSystemNotif(row);
+            }
+        } else if (payload.eventType === 'UPDATE') {
+            const wasWaiting = (oldRow.stage || 0) === 0, nowWaiting = (row.stage || 0) === 0;
+            if (wasWaiting && !nowWaiting) pesananMenungguCount = Math.max(0, pesananMenungguCount - 1);
+            else if (!wasWaiting && nowWaiting) pesananMenungguCount++;
+            _updatePesananBellBadge();
+        } else if (payload.eventType === 'DELETE') {
+            if ((oldRow.stage || 0) === 0) pesananMenungguCount = Math.max(0, pesananMenungguCount - 1);
+            _updatePesananBellBadge();
+        }
+    }
+
+    // Dipanggil sekali dari masukApp(): tampilkan bel, minta izin Notification, dan hitung
+    // dulu berapa pesanan yang SUDAH menunggu (jaga-jaga kalau ada order masuk selagi app
+    // Inventory ini tertutup) — tanpa bunyi alarm untuk hitungan awal ini.
+    async function initPesananNotif() {
+        const wrap = document.getElementById('pesanan-bell-wrap');
+        if (wrap) wrap.classList.remove('hidden');
+        _requestPesananNotifPermission();
+        if (!sbClient) { _updatePesananBellBadge(); return; }
+        try {
+            const { count, error } = await sbClient.from(PESANAN_TABLE).select('*', { count: 'exact', head: true }).eq('stage', 0);
+            if (!error) pesananMenungguCount = count || 0;
+        } catch (e) { console.warn('Gagal cek pesanan menunggu:', e.message); }
+        _updatePesananBellBadge();
+    }
+
+    // Auto-reconnect: kalau koneksi Realtime putus (jaringan sempat hilang, tab di-background
+    // lama lalu dibuka lagi, dsb), channel-nya di-subscribe ULANG otomatis tanpa perlu refresh
+    // manual. Pakai backoff (1s, 2s, 4s, 8s... maks 30s) supaya tidak spam reconnect kalau
+    // memang sedang offline total.
+    let _realtimeReconnectTimer = null;
+    let _realtimeReconnectDelay = 1000;
+    let _realtimeReconnecting = false;
+
+    function _scheduleRealtimeReconnect(reason) {
+        if (_realtimeReconnectTimer) return; // sudah ada jadwal reconnect berjalan
+        console.warn('⚠️ Realtime sync putus (' + reason + '), reconnect dalam ' + (_realtimeReconnectDelay / 1000) + 's...');
+        _realtimeReconnectTimer = setTimeout(() => {
+            _realtimeReconnectTimer = null;
+            _reconnectRealtimeSync();
+        }, _realtimeReconnectDelay);
+        _realtimeReconnectDelay = Math.min(_realtimeReconnectDelay * 2, 30000);
+    }
+
+    function _reconnectRealtimeSync() {
+        if (!sbClient || _realtimeReconnecting) return;
+        _realtimeReconnecting = true;
+        try {
+            if (_realtimeChannel) {
+                sbClient.removeChannel(_realtimeChannel);
+            }
+        } catch (e) { /* abaikan, channel lama mungkin sudah tidak valid */ }
+        _realtimeChannel = null;
+        _realtimeReconnecting = false;
+        initRealtimeSync();
+        // Setelah reconnect, tarik ulang semua data grup supaya perubahan yang mungkin
+        // terlewat SAAT koneksi putus tetap ikut ter-update (bukan cuma yang terjadi setelahnya).
+        _dirtyGroups = new Set(Object.keys(REALTIME_GROUP_HANDLERS));
         clearTimeout(_realtimeDebounceTimer);
         _realtimeDebounceTimer = setTimeout(async () => {
             const groups = [..._dirtyGroups];
@@ -3082,29 +3217,49 @@ async function fetchBayarSebagianData() {
                 await Promise.all(groups.map(g => REALTIME_GROUP_HANDLERS[g]?.fetch?.()));
                 groups.forEach(g => REALTIME_GROUP_HANDLERS[g]?.render?.());
             } catch (e) {
-                console.warn('Force refresh gagal:', e.message);
+                console.warn('Refresh setelah reconnect gagal:', e.message);
             }
-        }, 150);
+        }, 250);
     }
 
-    // PERBAIKAN: browser/PWA sering menahan (throttle) atau memutus WebSocket saat tab
-    // pindah ke background (layar dikunci, pindah app, dsb). Saat tab aktif kembali,
-    // pastikan channel realtime masih tersambung (reconnect kalau perlu) DAN tarik ulang
-    // semua data sebagai jaring pengaman untuk perubahan yang mungkin terlewat.
+    function initRealtimeSync() {
+        if (!sbClient || _realtimeChannel) return; // belum konek atau sudah aktif
+        let ch = sbClient.channel('radja-realtime-sync');
+        REALTIME_TABLES.forEach(t => {
+            ch = ch.on('postgres_changes', { event: '*', schema: 'public', table: t }, onRealtimeChange);
+        });
+        // Dengar tabel pesanan dari app Pesanan juga, di channel yang sama — khusus untuk notifikasi
+        // (lihat onPesananRealtimeChange), bukan untuk fetch/render data seperti tabel-tabel di atas.
+        ch = ch.on('postgres_changes', { event: '*', schema: 'public', table: PESANAN_TABLE }, onPesananRealtimeChange);
+        ch.subscribe((status) => {
+            if (status === 'SUBSCRIBED') {
+                console.log('✅ Realtime sync aktif');
+                // Konek sukses: reset backoff & bersihkan jadwal reconnect yang mungkin masih tertunda
+                _realtimeReconnectDelay = 1000;
+                if (_realtimeReconnectTimer) { clearTimeout(_realtimeReconnectTimer); _realtimeReconnectTimer = null; }
+            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+                console.warn('⚠️ Realtime sync gagal terhubung:', status);
+                _realtimeChannel = null; // supaya initRealtimeSync() berikutnya tidak nge-block karena dianggap "sudah aktif"
+                _scheduleRealtimeReconnect(status);
+            }
+        });
+        _realtimeChannel = ch;
+    }
+
+    // Reconnect juga saat tab kembali aktif (user balik dari app lain / kunci layar dibuka)
+    // atau saat browser mendeteksi internet baru nyambung lagi — dua situasi paling umum
+    // yang bikin koneksi WebSocket Realtime putus diam-diam di HP.
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState !== 'visible' || !sbClient) return;
-        const st = _realtimeChannel && _realtimeChannel.state;
-        if (st !== 'joined' && st !== 'joining') {
-            _realtimeChannel = null;
-            initRealtimeSync();
-        } else {
-            forceRefreshAllGroups();
+        if (document.visibilityState === 'visible' && sbClient) {
+            _realtimeReconnectDelay = 1000; // tab aktif lagi = coba langsung, tanpa nunggu backoff lama
+            _reconnectRealtimeSync();
         }
     });
     window.addEventListener('online', () => {
-        if (!sbClient) return;
-        _realtimeChannel = null;
-        initRealtimeSync();
+        if (sbClient) {
+            _realtimeReconnectDelay = 1000;
+            _reconnectRealtimeSync();
+        }
     });
 
     // Debounce + kumpulkan grup yang "kotor" (berubah): kalau ada banyak perubahan sekaligus
@@ -7704,7 +7859,32 @@ function updateSSK(tab, rowId) {
         const logoSrc = localStorage.getItem('app_logo') || '';
         const brandMain = getComputedStyle(document.documentElement).getPropertyValue('--brand-main').trim() || '#ff8c00';
         const now = new Date();
-        const noTagihan = 'TRX-' + String(Math.floor(Math.random()*90000)+10000).padStart(5,'0');
+        // PERBAIKAN: sebelumnya noTagihan di-generate ACAK setiap kali tombol ditekan
+        // (jadi transaksi yang sama bisa dapat nomor beda tiap dicetak, dan tidak nyambung
+        // dengan nomor "INV-{id}" yang dipakai app Pesanan untuk transaksi yang sama).
+        // Sekarang dipakai ID transaksi asli dari database supaya STABIL & KONSISTEN:
+        // - 1 transaksi dipilih -> TRX-{id} (sama persis basisnya dgn INV-{id} di app Pesanan)
+        // - lebih dari 1 transaksi digabung -> TRX-{id pertama}+{jumlah transaksi lain}
+        // PERBAIKAN: format sebelumnya "TRX-{id terkecil}+{jumlah lainnya}" bisa BENTROK —
+        // dua kombinasi transaksi yang beda isinya (mis. ID 12+45 vs ID 12+99) bisa dapat
+        // label sama persis "TRX-12+1" karena cuma mengandalkan id terkecil & jumlah anggota.
+        // Sekarang semua ID transaksi yang dipilih digabung penuh supaya kombinasi apa pun
+        // pasti unik. Kalau transaksi yang digabung banyak, disingkat (4 ID pertama + sisanya)
+        // supaya nomornya tidak kepanjangan tapi tetap unik (angka sisa ikut jadi pembeda).
+        // PERBAIKAN: transaksi yang berasal dari checkout online di app Pesanan sudah
+        // punya order_code aslinya sendiri (mis. "TRX-51718", sudah dicek unik di sana).
+        // Supaya nomor Surat Tagihan di Inventory PERSIS SAMA dengan yang dilihat customer
+        // di app Pesanan (bukan cuma sama angka beda prefix), order_code itu diprioritaskan
+        // kalau semua transaksi yang dipilih berasal dari 1 order_code yang sama. Kalau tidak
+        // ada order_code (transaksi diinput langsung di Inventory) atau transaksi yang digabung
+        // berasal dari order_code yang beda-beda, baru fallback ke skema berbasis id transaksi.
+        const orderCodes = [...new Set(selected.map(d => d.orderCode).filter(Boolean))];
+        const sortedIds = selected.map(d => d.id).sort((a,b) => a - b);
+        const noTagihan = orderCodes.length === 1
+            ? orderCodes[0]
+            : sortedIds.length <= 4
+                ? 'TRX-' + sortedIds.join('-')
+                : 'TRX-' + sortedIds.slice(0,4).join('-') + '+' + (sortedIds.length - 4);
         const tanggalCetak = now.toLocaleDateString('id-ID', { weekday:'long', day:'2-digit', month:'long', year:'numeric' });
         const mergeMap = {};
         selected.forEach(d => {
@@ -8965,6 +9145,8 @@ function updateSSK(tab, rowId) {
             const keterangan = 'LUNAS SEMUA';
 
             let berhasil = 0;
+            let gagal = 0;
+            let pesanErrorTerakhir = '';
             const orderCodesTerdampak = [];
             for (const t of creditTrx) {
                 const totalQty = t.items.reduce((s, i) => s + i.qty, 0);
@@ -8976,10 +9158,26 @@ function updateSSK(tab, rowId) {
                 const { data, error } = await sbClient.from('pelunasan').insert({
                     transaksi_id: t.id, vendor, jumlah: sisaHutang, keterangan, tanggal, jam
                 }).select().single();
-                if (error) continue;
+                if (error) {
+                    gagal++;
+                    pesanErrorTerakhir = error.message || 'gagal simpan pelunasan';
+                    console.error('Gagal insert pelunasan untuk transaksi', t.id, error);
+                    continue;
+                }
 
                 appData.pelunasan.unshift({ id: data.id, transaksi_id: t.id, vendor, jumlah: sisaHutang, keterangan, tanggal, jam });
-                await sbClient.from('transaksi').update({ status: 'lunas' }).eq('id', t.id);
+
+                const { error: errUpdate } = await sbClient.from('transaksi').update({ status: 'lunas' }).eq('id', t.id);
+                if (errUpdate) {
+                    // Rollback catatan pelunasan supaya tidak nyangkut setengah-setengah.
+                    await sbClient.from('pelunasan').delete().eq('id', data.id);
+                    appData.pelunasan = appData.pelunasan.filter(p => p.id !== data.id);
+                    gagal++;
+                    pesanErrorTerakhir = errUpdate.message || 'gagal update status transaksi';
+                    console.error('Gagal update status transaksi', t.id, errUpdate);
+                    continue;
+                }
+
                 t.status = 'lunas';
                 if (t.orderCode) orderCodesTerdampak.push(t.orderCode);
                 berhasil++;
@@ -8988,7 +9186,14 @@ function updateSSK(tab, rowId) {
             await syncPesananPembayaran(orderCodesTerdampak);
             renderPelunasanView();
             renderRiwayatTransaksi();
-            showToast(`🎉 ${berhasil} transaksi ${vendor} berhasil DILUNASI!`);
+
+            if (berhasil > 0 && gagal === 0) {
+                showToast(`🎉 ${berhasil} transaksi ${vendor} berhasil DILUNASI!`);
+            } else if (berhasil > 0 && gagal > 0) {
+                showToast(`⚠️ ${berhasil} berhasil, ${gagal} GAGAL dilunasi (${pesanErrorTerakhir})`);
+            } else {
+                showToast(`❌ Gagal melunasi transaksi ${vendor}: ${pesanErrorTerakhir}`);
+            }
         }, {title:'LUNAS SEMUA', type:'warning', icon:'💰', ok:'YA, LUNASI SEMUA'});
     }
 
@@ -9171,6 +9376,9 @@ function updateSSK(tab, rowId) {
             const keterangan = 'LUNAS TERPILIH';
 
             const orderCodesTerdampak = [];
+            let berhasil = 0;
+            let gagal = 0;
+            let pesanErrorTerakhir = '';
             for (const [trxId, sisaHutang] of selectedPelunasan.entries()) {
                 const trx = appData.riwayatTransaksi.find(t => t.id === trxId);
                 if (!trx || sisaHutang <= 0) continue;
@@ -9178,18 +9386,43 @@ function updateSSK(tab, rowId) {
                 const { data, error } = await sbClient.from('pelunasan').insert({
                     transaksi_id: trxId, vendor: trx.vendor, jumlah: sisaHutang, keterangan, tanggal, jam
                 }).select().single();
-                if (error) continue;
+                if (error) {
+                    gagal++;
+                    pesanErrorTerakhir = error.message || 'gagal simpan pelunasan';
+                    console.error('Gagal insert pelunasan untuk transaksi', trxId, error);
+                    continue;
+                }
 
                 appData.pelunasan.unshift({ id: data.id, transaksi_id: trxId, vendor: trx.vendor, jumlah: sisaHutang, keterangan, tanggal, jam });
-                await sbClient.from('transaksi').update({ status: 'lunas' }).eq('id', trxId);
+
+                const { error: errUpdate } = await sbClient.from('transaksi').update({ status: 'lunas' }).eq('id', trxId);
+                if (errUpdate) {
+                    // Rollback catatan pelunasan yang baru dibuat supaya data tidak nyangkut setengah-setengah
+                    // (sudah tercatat bayar tapi transaksi masih berstatus credit).
+                    await sbClient.from('pelunasan').delete().eq('id', data.id);
+                    appData.pelunasan = appData.pelunasan.filter(p => p.id !== data.id);
+                    gagal++;
+                    pesanErrorTerakhir = errUpdate.message || 'gagal update status transaksi';
+                    console.error('Gagal update status transaksi', trxId, errUpdate);
+                    continue;
+                }
+
                 trx.status = 'lunas';
                 if (trx.orderCode) orderCodesTerdampak.push(trx.orderCode);
+                berhasil++;
             }
 
             await syncPesananPembayaran(orderCodesTerdampak);
             renderPelunasanView();
             renderRiwayatTransaksi();
-            showToast(`🎉 ${selectedPelunasan.size} transaksi berhasil dilunasi!`);
+
+            if (berhasil > 0 && gagal === 0) {
+                showToast(`🎉 ${berhasil} transaksi berhasil dilunasi!`);
+            } else if (berhasil > 0 && gagal > 0) {
+                showToast(`⚠️ ${berhasil} berhasil, ${gagal} GAGAL dilunasi (${pesanErrorTerakhir})`);
+            } else {
+                showToast(`❌ Gagal melunasi transaksi: ${pesanErrorTerakhir}`);
+            }
         }, {title:'LUNASI TERPILIH', type:'success', icon:'💰', ok:'YA, LUNASI'});
     }
 
@@ -9226,13 +9459,27 @@ function updateSSK(tab, rowId) {
         const { data, error } = await sbClient.from('pelunasan').insert({
             transaksi_id: trxId, vendor, jumlah, keterangan, tanggal, jam
         }).select().single();
-        if (error) { showToast('❌ Gagal simpan pelunasan'); setButtonLoading(btnEl, false); _pelIsSaving = false; return; }
+        if (error) {
+            console.error('Gagal insert pelunasan untuk transaksi', trxId, error);
+            showToast('❌ Gagal simpan pelunasan: ' + (error.message || 'error tidak diketahui'));
+            setButtonLoading(btnEl, false); _pelIsSaving = false; return;
+        }
 
         appData.pelunasan.unshift({ id: data.id, transaksi_id: trxId, vendor, jumlah, keterangan, tanggal, jam });
 
         const trx = appData.riwayatTransaksi.find(t => Number(t.id) === trxId);
         if (trx) {
-            await sbClient.from('transaksi').update({ status: 'lunas' }).eq('id', trxId);
+            const { error: errUpdate } = await sbClient.from('transaksi').update({ status: 'lunas' }).eq('id', trxId);
+            if (errUpdate) {
+                // Rollback catatan pelunasan supaya tidak nyangkut setengah-setengah.
+                await sbClient.from('pelunasan').delete().eq('id', data.id);
+                appData.pelunasan = appData.pelunasan.filter(p => p.id !== data.id);
+                console.error('Gagal update status transaksi', trxId, errUpdate);
+                showToast('❌ Gagal menandai transaksi LUNAS: ' + (errUpdate.message || 'error tidak diketahui'));
+                setButtonLoading(btnEl, false);
+                _pelIsSaving = false;
+                return;
+            }
             trx.status = 'lunas';
             if (trx.orderCode) await syncPesananPembayaran([trx.orderCode]);
             showToast('🎉 Transaksi LUNAS PENUH!');
