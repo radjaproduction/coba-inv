@@ -2,8 +2,8 @@
 // SERVICE WORKER - RADJA PRODUCTION PWA
 // ============================================
 
-const CACHE_NAME = 'radja-production-v8.1.3';
-const STATIC_CACHE = 'radja-static-v8.1.3';
+const CACHE_NAME = 'radja-production-v8.1.4';
+const STATIC_CACHE = 'radja-static-v8.1.4';
 const BASE = '/inventory';
 
 const STATIC_ASSETS = [
