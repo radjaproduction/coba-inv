@@ -3136,23 +3136,37 @@ async function fetchBayarSebagianData() {
         // kadang tidak kepilih di percobaan pertama.
         speechSynthesis.addEventListener('voiceschanged', () => { _voicesPesananReady = true; });
     }
+    let _speakInProgress = false;
     function _speakPesananAlarm(text) {
         try {
             if (!('speechSynthesis' in window)) { _playPesananAlarm(); return; }
-            speechSynthesis.cancel(); // hentikan antrian ucapan lama (jaga-jaga ada pesanan beruntun)
+            // Kalau masih ada ucapan yang sedang jalan (misal event pesanan sempat terkirim
+            // dobel karena reconnect realtime), JANGAN cancel() lalu speak() lagi — dua
+            // panggilan speak() yang bertumpukan saling membatalkan (utterance pertama
+            // langsung error sebelum sempat bunyi). Cukup abaikan panggilan susulan ini.
+            if (_speakInProgress || speechSynthesis.speaking || speechSynthesis.pending) {
+                console.log('[Suara Pesanan] Masih ada ucapan berjalan, panggilan baru diabaikan (mencegah tabrakan).');
+                return;
+            }
+            _speakInProgress = true;
             const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka');
             utter.lang = 'id-ID';
             utter.rate = 0.95;
             utter.pitch = 1;
             utter.volume = 1;
-            // Pilih suara Bahasa Indonesia kalau tersedia di device; kalau tidak ada,
-            // biarkan browser pakai suara default (masih akan terbaca, cuma logat berbeda).
             const voices = speechSynthesis.getVoices();
             const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('id'));
             if (idVoice) utter.voice = idVoice;
-            utter.onerror = () => _playPesananAlarm(); // fallback beep kalau TTS gagal di tengah jalan
+            utter.onstart = () => console.log('[Suara Pesanan] Mulai bicara...');
+            utter.onend = () => { _speakInProgress = false; console.log('[Suara Pesanan] Selesai.'); };
+            utter.onerror = (ev) => {
+                _speakInProgress = false;
+                console.warn('[Suara Pesanan] TTS gagal, fallback ke beep. Alasan:', ev.error);
+                _playPesananAlarm();
+            };
             speechSynthesis.speak(utter);
         } catch (e) {
+            _speakInProgress = false;
             console.warn('Suara pesanan gagal diputar, fallback ke beep:', e.message);
             _playPesananAlarm();
         }
@@ -3202,10 +3216,26 @@ async function fetchBayarSebagianData() {
     // Dipasang sebagai listener tambahan pada channel Realtime yang sama di initRealtimeSync().
     // Dipisah dari REALTIME_GROUP_HANDLERS karena app ini tidak menyimpan data pesanan sendiri —
     // hanya perlu tahu ADA perubahan untuk urusan notifikasi, bukan nge-fetch & render ulang data.
+    // Kadang, pas koneksi realtime sempat reconnect (channel lama & baru overlap sesaat),
+    // event INSERT yang sama bisa terkirim DOBEL. Simpan id order yang baru saja diproses
+    // supaya tidak dihitung/diucapkan dua kali untuk order yang sama.
+    const _pesananProcessedIds = new Set();
     function onPesananRealtimeChange(payload) {
         console.log('[Pesanan RT] event diterima:', payload.eventType, payload.new || payload.old);
         const row = payload.new || {}, oldRow = payload.old || {};
         if (payload.eventType === 'INSERT') {
+            if (row.id != null) {
+                if (_pesananProcessedIds.has(row.id)) {
+                    console.log('[Pesanan RT] Order id', row.id, 'sudah pernah diproses, event dobel diabaikan.');
+                    return;
+                }
+                _pesananProcessedIds.add(row.id);
+                // Jaga Set tidak membengkak selamanya — cukup simpan 200 id terakhir.
+                if (_pesananProcessedIds.size > 200) {
+                    const first = _pesananProcessedIds.values().next().value;
+                    _pesananProcessedIds.delete(first);
+                }
+            }
             if ((row.stage || 0) === 0) {
                 pesananMenungguCount++;
                 _updatePesananBellBadge();
