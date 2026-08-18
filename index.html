@@ -3137,32 +3137,50 @@ async function fetchBayarSebagianData() {
         speechSynthesis.addEventListener('voiceschanged', () => { _voicesPesananReady = true; });
     }
     let _speakInProgress = false;
-    function _speakPesananAlarm(text) {
+    // _isRetry: dipakai internal saat percobaan kedua (suara default, tanpa maksa lang id-ID).
+    // Beberapa HP Android belum punya paket suara Bahasa Indonesia ter-install di TTS sistemnya —
+    // memaksa utter.lang='id-ID' pada kondisi begini bikin speechSynthesis error (language-unavailable/
+    // synthesis-failed) dan dulu langsung nyerah ke beep. Sekarang dicoba dulu pakai suara default
+    // HP (tanpa lang dipaksa) sebelum benar-benar fallback ke beep.
+    function _speakPesananAlarm(text, _isRetry) {
         try {
             if (!('speechSynthesis' in window)) { _playPesananAlarm(); return; }
             // Kalau masih ada ucapan yang sedang jalan (misal event pesanan sempat terkirim
             // dobel karena reconnect realtime), JANGAN cancel() lalu speak() lagi — dua
             // panggilan speak() yang bertumpukan saling membatalkan (utterance pertama
             // langsung error sebelum sempat bunyi). Cukup abaikan panggilan susulan ini.
-            if (_speakInProgress || speechSynthesis.speaking || speechSynthesis.pending) {
+            if (!_isRetry && (_speakInProgress || speechSynthesis.speaking || speechSynthesis.pending)) {
                 console.log('[Suara Pesanan] Masih ada ucapan berjalan, panggilan baru diabaikan (mencegah tabrakan).');
                 return;
             }
             _speakInProgress = true;
             const utter = new SpeechSynthesisUtterance(text || 'Ada pesanan masuk, harap segera dibuka');
-            utter.lang = 'id-ID';
             utter.rate = 0.95;
             utter.pitch = 1;
             utter.volume = 1;
-            const voices = speechSynthesis.getVoices();
-            const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('id'));
-            if (idVoice) utter.voice = idVoice;
-            utter.onstart = () => console.log('[Suara Pesanan] Mulai bicara...');
+            if (!_isRetry) {
+                // Percobaan pertama: coba pakai voice Bahasa Indonesia kalau tersedia.
+                utter.lang = 'id-ID';
+                const voices = speechSynthesis.getVoices();
+                const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('id'));
+                if (idVoice) utter.voice = idVoice;
+            }
+            // _isRetry: lang/voice sengaja TIDAK diisi sama sekali, biar browser/HP pakai
+            // suara default bawaannya sendiri (biasanya Bahasa Inggris, tapi tetap suara
+            // manusia — lebih baik daripada beep).
+            utter.onstart = () => console.log('[Suara Pesanan] Mulai bicara...' + (_isRetry ? ' (pakai suara default, id-ID tidak tersedia)' : ''));
             utter.onend = () => { _speakInProgress = false; console.log('[Suara Pesanan] Selesai.'); };
             utter.onerror = (ev) => {
                 _speakInProgress = false;
-                console.warn('[Suara Pesanan] TTS gagal, fallback ke beep. Alasan:', ev.error);
-                _playPesananAlarm();
+                console.warn('[Suara Pesanan] TTS gagal (percobaan ' + (_isRetry ? 'ke-2, default voice' : 'ke-1, id-ID') + '). Alasan:', ev.error);
+                if (!_isRetry) {
+                    // Kemungkinan besar penyebab: paket suara Bahasa Indonesia belum ter-install
+                    // di HP. Coba sekali lagi pakai suara default sebelum nyerah ke beep.
+                    _speakPesananAlarm(text, true);
+                } else {
+                    console.warn('[Suara Pesanan] Suara default juga gagal, HP ini kemungkinan tidak punya TTS engine yang jalan. Fallback ke beep.');
+                    _playPesananAlarm();
+                }
             };
             speechSynthesis.speak(utter);
         } catch (e) {
