@@ -30,7 +30,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
     <title>Radja Production - App</title>
 
-    <link rel="manifest" href="/coba-inv/manifest.json">
+    <link rel="manifest" href="/inventory/manifest.json">
     <meta name="theme-color" content="#F6DBB6">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -39,9 +39,9 @@
     <!-- Cegah browser Android/Chrome memunculkan toolbar pencarian -->
     <meta name="mobile-web-app-capable" content="yes">
     <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;">
-    <link rel="apple-touch-icon" href="/coba-inv/icon-192.png">
-    <link rel="icon" type="image/png" sizes="192x192" href="/coba-inv/icon-192.png">
-    <link rel="icon" type="image/png" sizes="512x512" href="/coba-inv/icon-512.png">
+    <link rel="apple-touch-icon" href="/inventory/icon-192.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/inventory/icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="/inventory/icon-512.png">
 
     <script>
         // ==================== NOTIFIKASI UPDATE VERSI APLIKASI ====================
@@ -74,7 +74,7 @@
 
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/coba-inv/service-worker.js')
+                navigator.serviceWorker.register('/inventory/service-worker.js')
                     .then(reg => {
                         console.log('✅ SW registered:', reg.scope);
                         _swRegistrationGlobal = reg;
@@ -3142,6 +3142,7 @@ async function fetchBayarSebagianData() {
     // Dipisah dari REALTIME_GROUP_HANDLERS karena app ini tidak menyimpan data pesanan sendiri —
     // hanya perlu tahu ADA perubahan untuk urusan notifikasi, bukan nge-fetch & render ulang data.
     function onPesananRealtimeChange(payload) {
+        console.log('[Pesanan RT] event diterima:', payload.eventType, payload.new || payload.old);
         const row = payload.new || {}, oldRow = payload.old || {};
         if (payload.eventType === 'INSERT') {
             if ((row.stage || 0) === 0) {
@@ -3197,14 +3198,13 @@ async function fetchBayarSebagianData() {
 
     function _reconnectRealtimeSync() {
         if (!sbClient || _realtimeReconnecting) return;
-        _realtimeReconnecting = true;
+        _realtimeReconnecting = true; // tetap true sampai subscribe() baru selesai (lihat initRealtimeSync)
         try {
             if (_realtimeChannel) {
                 sbClient.removeChannel(_realtimeChannel);
             }
         } catch (e) { /* abaikan, channel lama mungkin sudah tidak valid */ }
         _realtimeChannel = null;
-        _realtimeReconnecting = false;
         initRealtimeSync();
         // Setelah reconnect, tarik ulang semua data grup supaya perubahan yang mungkin
         // terlewat SAAT koneksi putus tetap ikut ter-update (bukan cuma yang terjadi setelahnya).
@@ -3224,7 +3224,11 @@ async function fetchBayarSebagianData() {
 
     function initRealtimeSync() {
         if (!sbClient || _realtimeChannel) return; // belum konek atau sudah aktif
-        let ch = sbClient.channel('radja-realtime-sync');
+        // Nama channel dibuat UNIK tiap percobaan (bukan 'radja-realtime-sync' tetap) — supaya kalau
+        // ada reconnect beruntun (koneksi sempat putus-nyambung cepat), kita tidak pernah kebagian
+        // channel LAMA yang ternyata masih berstatus subscribed di sisi client, yang bikin error
+        // "cannot add postgres_changes callbacks ... after subscribe()" dan mematikan seluruh sinkron.
+        let ch = sbClient.channel('radja-realtime-sync-' + Date.now());
         REALTIME_TABLES.forEach(t => {
             ch = ch.on('postgres_changes', { event: '*', schema: 'public', table: t }, onRealtimeChange);
         });
@@ -3237,9 +3241,11 @@ async function fetchBayarSebagianData() {
                 // Konek sukses: reset backoff & bersihkan jadwal reconnect yang mungkin masih tertunda
                 _realtimeReconnectDelay = 1000;
                 if (_realtimeReconnectTimer) { clearTimeout(_realtimeReconnectTimer); _realtimeReconnectTimer = null; }
+                _realtimeReconnecting = false; // baru boleh dianggap "selesai reconnect" setelah benar-benar SUBSCRIBED
             } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
                 console.warn('⚠️ Realtime sync gagal terhubung:', status);
                 _realtimeChannel = null; // supaya initRealtimeSync() berikutnya tidak nge-block karena dianggap "sudah aktif"
+                _realtimeReconnecting = false; // lepas guard supaya _scheduleRealtimeReconnect bisa jalan lagi
                 _scheduleRealtimeReconnect(status);
             }
         });
